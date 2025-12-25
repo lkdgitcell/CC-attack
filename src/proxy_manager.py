@@ -1,12 +1,9 @@
-"""
-Proxy management with async downloading, validation, and rotation.
-"""
+"""Proxy management with async downloading, validation, and efficient rotation."""
 
 import asyncio
 import random
 from pathlib import Path
 from typing import List, Optional, Set
-from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp_socks import ProxyConnector, ProxyType as SocksProxyType
@@ -17,9 +14,8 @@ from src.logger import logger
 
 
 class ProxyManager:
-    """Manages proxy downloading, validation, and rotation."""
+    """Efficient proxy manager with O(1) rotation and lazy loading."""
 
-    # Proxy source APIs
     SOCKS4_SOURCES = [
         "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4",
         "https://openproxylist.xyz/socks4.txt",
@@ -54,32 +50,15 @@ class ProxyManager:
     ]
 
     def __init__(self, proxy_type: ProxyType = ProxyType.SOCKS5):
-        """
-        Initialize ProxyManager.
-
-        Args:
-            proxy_type: Type of proxies to manage.
-        """
         self.proxy_type = proxy_type
         self.proxies: List[ProxyConfig] = []
+        self.alive_proxies: List[ProxyConfig] = []
         self.dead_proxies: Set[str] = set()
         self._lock = asyncio.Lock()
 
         logger.info("proxy_manager_initialized", proxy_type=proxy_type.value)
 
     async def download_proxies(self, output_file: Optional[Path] = None) -> int:
-        """
-        Download proxies from multiple sources.
-
-        Args:
-            output_file: Optional file path to save proxies.
-
-        Returns:
-            Number of proxies downloaded.
-
-        Raises:
-            ValueError: If proxy type is invalid.
-        """
         sources = {
             ProxyType.SOCKS4: self.SOCKS4_SOURCES,
             ProxyType.SOCKS5: self.SOCKS5_SOURCES,
@@ -108,7 +87,6 @@ class ProxyManager:
                 if result:
                     all_proxies.update(result)
 
-        # Parse proxies
         for proxy_str in all_proxies:
             try:
                 proxy = self._parse_proxy(proxy_str.strip())
@@ -117,9 +95,10 @@ class ProxyManager:
             except ValueError as e:
                 logger.debug("invalid_proxy", proxy=proxy_str, error=str(e))
 
-        # Save to file if requested
         if output_file:
             await self._save_proxies(output_file)
+
+        self.alive_proxies = self.proxies.copy()
 
         logger.info(
             "proxies_downloaded",
@@ -132,7 +111,6 @@ class ProxyManager:
     async def _download_from_source(
         self, session: aiohttp.ClientSession, url: str
     ) -> List[str]:
-        """Download proxies from a single source."""
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
@@ -151,30 +129,13 @@ class ProxyManager:
             return []
 
     def _parse_proxy(self, proxy_str: str) -> Optional[ProxyConfig]:
-        """
-        Parse proxy string into ProxyConfig.
-
-        Args:
-            proxy_str: Proxy string (host:port or user:pass@host:port).
-
-        Returns:
-            ProxyConfig object or None if invalid.
-
-        Raises:
-            ValueError: If proxy format is invalid.
-        """
-        if not proxy_str or ':' not in proxy_str:
-            return None
-
-        # Skip comments
-        if proxy_str.startswith('#'):
+        if not proxy_str or ':' not in proxy_str or proxy_str.startswith('#'):
             return None
 
         parts = proxy_str.split(':')
         if len(parts) < 2:
             return None
 
-        # Handle auth proxies (user:pass@host:port)
         if '@' in proxy_str:
             auth, location = proxy_str.rsplit('@', 1)
             username, password = auth.split(':', 1)
@@ -187,7 +148,6 @@ class ProxyManager:
                 password=password,
             )
 
-        # Simple format (host:port)
         host = parts[0]
         port_str = parts[1]
 
@@ -205,18 +165,6 @@ class ProxyManager:
             return None
 
     async def load_from_file(self, file_path: Path) -> int:
-        """
-        Load proxies from a file.
-
-        Args:
-            file_path: Path to proxy file.
-
-        Returns:
-            Number of proxies loaded.
-
-        Raises:
-            FileNotFoundError: If file doesn't exist.
-        """
         if not file_path.exists():
             raise FileNotFoundError(f"Proxy file not found: {file_path}")
 
@@ -231,7 +179,6 @@ class ProxyManager:
                 if proxy:
                     self.proxies.append(proxy)
 
-        # Remove duplicates
         seen = set()
         unique_proxies = []
         for proxy in self.proxies:
@@ -240,12 +187,12 @@ class ProxyManager:
                 unique_proxies.append(proxy)
 
         self.proxies = unique_proxies
+        self.alive_proxies = self.proxies.copy()
 
         logger.info("proxies_loaded", total=len(self.proxies))
         return len(self.proxies)
 
     async def _save_proxies(self, file_path: Path) -> None:
-        """Save proxies to file."""
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(file_path, 'w') as f:
@@ -255,15 +202,6 @@ class ProxyManager:
         logger.info("proxies_saved", file=str(file_path), total=len(self.proxies))
 
     async def validate_proxies(self, max_concurrent: int = 100) -> int:
-        """
-        Validate all proxies concurrently.
-
-        Args:
-            max_concurrent: Maximum concurrent validation requests.
-
-        Returns:
-            Number of working proxies.
-        """
         if not self.proxies:
             logger.warning("no_proxies_to_validate")
             return 0
@@ -278,13 +216,13 @@ class ProxyManager:
 
         results = await asyncio.gather(*tasks)
 
-        # Filter out dead proxies
         working_proxies = [
             proxy for proxy, is_valid in zip(self.proxies, results) if is_valid
         ]
 
         removed = len(self.proxies) - len(working_proxies)
         self.proxies = working_proxies
+        self.alive_proxies = working_proxies.copy()
 
         logger.info(
             "validation_complete",
@@ -297,10 +235,8 @@ class ProxyManager:
     async def _validate_proxy(
         self, proxy: ProxyConfig, semaphore: asyncio.Semaphore
     ) -> bool:
-        """Validate a single proxy."""
         async with semaphore:
             try:
-                # Convert ProxyType to aiohttp-socks ProxyType
                 proxy_type_map = {
                     ProxyType.SOCKS4: SocksProxyType.SOCKS4,
                     ProxyType.SOCKS5: SocksProxyType.SOCKS5,
@@ -330,35 +266,25 @@ class ProxyManager:
                 return False
 
     def get_random_proxy(self) -> Optional[ProxyConfig]:
-        """
-        Get a random working proxy.
-
-        Returns:
-            Random ProxyConfig or None if no proxies available.
-        """
-        available = [p for p in self.proxies if p.address not in self.dead_proxies]
-
-        if not available:
-            # Reset dead proxies if all are dead
+        if not self.alive_proxies:
             if self.proxies:
                 logger.warning("all_proxies_dead_resetting")
                 self.dead_proxies.clear()
-                available = self.proxies
+                self.alive_proxies = self.proxies.copy()
             else:
                 return None
 
-        return random.choice(available)
+        return random.choice(self.alive_proxies)
 
     def mark_dead(self, proxy: ProxyConfig) -> None:
-        """Mark a proxy as dead."""
         self.dead_proxies.add(proxy.address)
+        self.alive_proxies = [p for p in self.proxies if p.address not in self.dead_proxies]
         logger.debug("proxy_marked_dead", proxy=proxy.address)
 
     def get_stats(self) -> dict:
-        """Get proxy statistics."""
         return {
             "total": len(self.proxies),
-            "active": len(self.proxies) - len(self.dead_proxies),
+            "active": len(self.alive_proxies),
             "dead": len(self.dead_proxies),
             "type": self.proxy_type.value,
         }

