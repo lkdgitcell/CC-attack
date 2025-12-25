@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""
-Launch the web dashboard server.
-
-Quick start script for the web interface.
-"""
 
 import sys
 from pathlib import Path
 
-# Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.web.app import run

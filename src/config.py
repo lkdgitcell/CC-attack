@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # Application
     app_name: str = "HTTP Load Tester EDU"
-    app_version: str = "4.0.0"
+    app_version: str = "4.0.1"
     debug: bool = Field(default=False, description="Enable debug mode")
 
     # Paths
